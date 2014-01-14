@@ -71,7 +71,9 @@ stepCSF csf inp = newIORef [] >>= stepCSF' csf inp where
 
 
 -- CMonad specific versions of letW and forkSF (for ease of coding)
+letW :: forall rw rb t a b. [t] -> (Whitehole rw t -> Blackhole rb t -> CSF a b) -> CSF a b
 letW = letW' wdHandler
+forkSF :: CSF a b -> CSF () () -> CSF a b
 forkSF e ef = initialAction getTIDRef (\tidRef -> forkSF' threadHandler (runCSF' tidRef) e ef)
 --forkSF = (initialAction getTIDRef .) . flip . flip ((forkSF' threadHandler) . runCSF')
 

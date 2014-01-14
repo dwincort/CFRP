@@ -1,4 +1,5 @@
 {-# LANGUAGE ExistentialQuantification, ScopedTypeVariables, FlexibleContexts, FlexibleInstances, FunctionalDependencies #-}
+--{-# LANGUAGE UndecidableInstances, OverlappingInstances #-}
 
 module CFRP (
   Resource (..), BResource (..), 
@@ -12,6 +13,7 @@ import Control.Concurrent.MonadIO
 
 import Data.IORef
 import Control.Monad (forM_)
+import Data.Maybe (listToMaybe)
 
 import SF
 import MSF
@@ -28,10 +30,13 @@ class Resource rt a b | rt -> a, rt -> b where
 
 class Resource rt a [b] => BResource rt a b | rt -> a, rt -> b where
   bprocess :: rt -> a -> IO (Maybe b)
+  bprocess rt a = process rt a >>= (return . listToMaybe)
   brsf :: MonadIO m => rt -> MSF m {-S rt-} a b
   brsf rt = pipe (liftIO . f) where
     {- Should that be a threadDelay instead of a yield? -}
     f a = bprocess rt a >>= maybe (yield >> f a) return
+
+--instance Resource rt a [b] => BResource rt a b
 
 
 -----------------------------------------------------------

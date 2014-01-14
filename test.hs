@@ -1,4 +1,4 @@
-{-# LANGUAGE Arrows, MultiParamTypeClasses, TypeSynonymInstances, FlexibleInstances #-}
+{-# LANGUAGE Arrows, MultiParamTypeClasses, TypeSynonymInstances, FlexibleInstances, ExistentialQuantification, FlexibleContexts #-}
 import Control.Arrow
 import CSF
 
@@ -36,9 +36,12 @@ countToN = letW [-1] $ \wh bh -> proc ma -> do
 
 runTest = stepCSF
 
+test0 :: forall w b t. (BResource w () t, Resource b t ()) => w -> b -> CSF t t
+test0 wh bh = rsf bh >>> brsf wh
+
 -- 1) Testing wormholes functioning as a delay operator
 -- runTest test1 [1..5]
-test1 = letW [] $ \wh bh -> rsf bh >>> rsf wh
+test1 = letW [] $ test0
 -- 2) Testing brsf updating
 -- runTest test2 [1..5]
 test2 = letW [] $ \wh bh -> rsf bh >>> brsf wh
