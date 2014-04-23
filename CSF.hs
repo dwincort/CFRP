@@ -1,4 +1,4 @@
-{-# LANGUAGE Arrows #-}
+{-# LANGUAGE Arrows, ExistentialQuantification #-}
 
 module CSF (
   CSF, runCSF, stepCSF, 
