@@ -11,6 +11,8 @@ module CSF (
 ) where
 
 import Control.Arrow
+import Control.Monad (ap)
+import Control.Applicative
 import Control.Concurrent.MonadIO
 
 import Data.IORef
@@ -23,55 +25,81 @@ import MSF
 import CFRP
 
 -----------------------------------------------------------
------------------------ ThreadState -----------------------
+---------------------- Process State ----------------------
 -----------------------------------------------------------
 
--- The ThreadState object is essentially a tree of thread information 
--- that is extended in choice operations and forking.  Choice will 
--- also have the capability of accessing the thread tree in order to 
--- kill all child threads.
+-- A given iteration of a signal function process can be thought of like a 
+-- transaction.  In some situations, processes need to be frozen or killed, 
+-- but the iteration they are currently executing must either complete or 
+-- rollback.  We implement this by allowing it to complete but ignoring its 
+-- effects, making it essentially behave like a rollback (but with poorer 
+-- performance -- maybe we can fix that later.
 
-newtype ThreadState = ThreadState (IORef ([ThreadId], [ThreadState]))
-  deriving Eq
+-- These types describe Process information.  PStatus is the status of a 
+-- given process, and each process has a status kept in an MVar knows as 
+-- the PController.  Processes may also have PChilds, from either forks 
+-- or choice statements, and these are grouped in an IORef called 
+-- PChildren.  A process State (PState) is the pair of the controller 
+-- and the process's children.
 
--- Construct a new ThreadState object
-newThreadState :: IO ThreadState
-newThreadState = do
-  ref <- newIORef ([],[])
-  return $ ThreadState ref
+data PStatus = Proceed | ShouldFreeze | ShouldSkip | Frozen (MVar ()) | Die
+type PController = MVar PStatus
+data PChild = PForkChild PState | PChoiceChild PChildren
+type PChildren = IORef [PChild]
+type PState = (PController, PChildren)
 
--- Given the incoming thread state and a stored thread ID, this function 
--- returns True iff the thread ID is in this thread state's thread ID list.
-haveIForked :: ThreadState -> ThreadId -> IO Bool
-haveIForked (ThreadState ts) t = do
-  (tids, _) <- readIORef ts
-  return $ elem t tids
+-- Constructs a new PChildren object
+newPChildren :: IO PChildren
+newPChildren = newIORef []
 
--- Given the incoming thread state and a stored thread state, this function 
--- returns True iff the thread state is in this thread state's thread state list.
-haveIForked' :: ThreadState -> ThreadState -> IO Bool
-haveIForked' (ThreadState ts) ts' = do
-  (_, tss) <- readIORef ts
-  return $ elem ts' tss
+-- Construct a new PState object with the given PStatus in the PController
+newPState :: PStatus -> IO PState
+newPState status = do
+  mvar <- newMVar status
+  pc <- newPChildren
+  return (mvar, pc)
 
--- getThreads recursively looks through all ThreadState references of the 
--- given thread state to return all child thread IDs.
-getThreads :: ThreadState -> IO [ThreadId]
-getThreads (ThreadState ts) = do
-  (tids, tss) <- readIORef ts
-  tids' <- mapM getThreads tss
-  return $ tids ++ concat tids'
+-- This function applies the given function f to all children, grandchildren, 
+-- etc. in the given PChildren.  That is, it acts on all PControllers 
+-- recursively within the given PChildren.  It is guaranteed to always act 
+-- and complete on parents before accessing and then moving on to children.
+actOnChildren :: (PController -> IO ()) -> PChildren -> IO ()
+actOnChildren f ref = do
+  childs <- readIORef ref
+  mapM_ act childs
+ where
+  act (PForkChild (pc, children)) = f pc >> actOnChildren f children
+  act (PChoiceChild children) = actOnChildren f children
 
--- Adds a thread state (second argument) to a thread state (first argument).
--- The output is the same as the second argument, which is convenient for 
--- certain callers.
-addTS :: ThreadState -> ThreadState -> IO ThreadState
-addTS (ThreadState ts) ts' = atomicModifyIORef ts $ \(tids, tss) -> ((tids, ts':tss),ts')
 
--- Adds a thread ID and accompanying thread state (second argument) 
--- to a thread state (first argument).
-addTid :: ThreadState -> (ThreadId, ThreadState) -> IO ()
-addTid (ThreadState ts) (tid, ts') = atomicModifyIORef ts $ \(tids, tss) -> ((tid:tids, ts':tss),())
+-- These three functions are the functions to send to actOnChildren 
+-- to awaken, freeze, or kill all children.
+
+wakeProcess :: PController -> IO ()
+wakeProcess mvar = do
+  currentState <- takeMVar mvar
+  case currentState of
+    Proceed -> putMVar mvar Proceed
+    ShouldFreeze -> putMVar mvar ShouldSkip
+    ShouldSkip -> putMVar mvar ShouldSkip
+    Frozen wait -> putMVar mvar Proceed >> putMVar wait ()
+    Die -> putMVar mvar Die
+
+freezeProcess :: PController -> IO ()
+freezeProcess mvar = do
+  currentState <- takeMVar mvar
+  case currentState of
+    Proceed -> putMVar mvar ShouldFreeze
+    ShouldFreeze -> putMVar mvar ShouldFreeze
+    ShouldSkip -> putMVar mvar ShouldFreeze
+    Frozen wait -> putMVar mvar currentState
+    Die -> putMVar mvar Die
+
+killProcess :: PController -> IO ()
+killProcess mvar = do
+  _currentState <- takeMVar mvar
+  putMVar mvar Die
+
 
 -----------------------------------------------------------
 ------------------------- CMonad --------------------------
@@ -79,44 +107,67 @@ addTid (ThreadState ts) (tid, ts') = atomicModifyIORef ts $ \(tids, tss) -> ((ti
 
 type CSF = MSF CMonad
 -- CMonad is an extension to IO to allow tracking of wormhole data 
--- and thread data.  It is essentially just a reader and writer monad, 
+-- and process data.  It is essentially just a reader and writer monad, 
 -- but we define it explicitly.
-newtype CMonad a = CMonad {unC :: ThreadState -> IO ([RData], a)}
+newtype CMonad a = CMonad {unC :: PState -> IO ([RData], a)}
+
+-- Adds a PChild to the children of the PState in this CMonad
+addPChild :: PChild -> CMonad ()
+addPChild child = CMonad $ \(_,children) -> (atomicModifyIORef children $ \lst -> (child:lst,())) >> return ([],())
+
+instance Functor CMonad where
+  fmap f xs = xs >>= return . f
+
+instance Applicative CMonad where
+  pure = return
+  (<*>) = ap
 
 instance Monad CMonad where
   return a = CMonad $ const $ return ([],a)
-  (CMonad c) >>= f = CMonad $ \ts -> do 
-    (rds,  a) <- c ts
-    (rds', b) <- (unC $ f a) ts
+  (CMonad c) >>= f = CMonad $ \ps -> do 
+    (rds,  a) <- c ps
+    (rds', b) <- (unC $ f a) ps
     return (rds++rds', b)
 
 instance MonadWriter [RData] CMonad where
   tell w = CMonad $ const $ return (w,())
-  listen (CMonad c) = CMonad $ \ts -> do
-    (rds, a) <- c ts
+  listen (CMonad c) = CMonad $ \ps -> do
+    (rds, a) <- c ps
     return (rds, (a, rds))
-  pass (CMonad c) = CMonad $ \ts -> do
-    (rds, (a, ww)) <- c ts
+  pass (CMonad c) = CMonad $ \ps -> do
+    (rds, (a, ww)) <- c ps
     return (ww rds, a)
 
 instance MonadIO CMonad where
   liftIO a = CMonad $ const $ a >>= (\v -> return ([],v))
 
--- The ArrowChoice instance is overridden to allow arrow choice to kill 
+-- The ArrowChoice instance is overridden to allow arrow choice to freeze 
 -- child threads of unchosen branches.
 instance ArrowChoice CSF where
-  left msf = initialAction (liftIO newThreadState) (\ts -> MSF (h msf ts)) where
-    h msf tsi x = 
+  left msf = initialAction act (\pc -> MSF (h msf pc)) where
+    act = do
+      pc <- liftIO newPChildren
+      addPChild (PChoiceChild pc)
+      return pc
+    h msf choiceChildren x = 
+      -- We are only allowed to actOnChildren here if we are in a Proceed state.
+      -- Otherwise, we are in skip/freeze/die, and we have no authority.
       case x of
-        Left x' -> CMonad $ \ts -> do 
-          b <- haveIForked' ts tsi
-          ts' <- if b then return tsi else newThreadState >>= addTS ts 
-          (rdata, (y, msf')) <- unC (msfFun msf x') ts'
-          return (rdata, (Left y, MSF (h msf' ts')))
-        Right y -> do 
-          tids <- liftIO $ getThreads tsi
-          liftIO $ mapM_ killThread tids
-          return (Right y, MSF (h msf tsi))
+        Left x' -> CMonad $ \(ps,_pc) -> do
+          status <- takeMVar ps --begin critical region
+          case status of
+            Proceed -> actOnChildren wakeProcess choiceChildren
+            _ -> return ()
+          putMVar ps status --end critical region
+          (rdata, (y, msf')) <- unC (msfFun msf x') (ps,choiceChildren)
+          return (rdata, (Left y, MSF (h msf' choiceChildren)))
+        Right z -> CMonad $ \(ps,_pc) -> do
+          status <- takeMVar ps --begin critical region
+          case status of
+            Proceed -> actOnChildren freezeProcess choiceChildren
+            _ -> return ()
+          putMVar ps status --end critical region
+          return ([],(Right z, MSF (h msf choiceChildren)))
   f ||| g = f +++ g >>> arr untag
         where
           untag (Left x) = x
@@ -124,39 +175,52 @@ instance ArrowChoice CSF where
 
 
 -- Running and stepping through CSFs
-runCSF :: a -> ThreadState -> CSF a b -> IO b
-runCSF a ts f = run f where 
-  run (MSF f) = do 
-    (rds, (y, f')) <- (unC $ f a) ts
-    stepRData rds
-    run f'
+runCSF :: a -> PState -> CSF a b -> IO b
+runCSF a (ps@(mvar, _)) f = run f where 
+  run f = do 
+    (rds, (y, f')) <- (unC $ msfFun f $ a) ps
+    -- We read our MVar, which tells us how we should handle resource effects
+    command <- takeMVar mvar --begin critical region
+    case command of
+      -- Only if we are GO for proceeding do we stepRData
+      -- stepRData performs the Ft-Time transition
+      -- TODO: We may need to add strictness points (evaluate) within rds to make sure 
+      --       that this call is short - it should be performing effects 
+      --       rather than computing values.
+      Proceed -> stepRData rds >> putMVar mvar Proceed >> run f'
+      ShouldFreeze -> do
+        wait <- newEmptyMVar
+        putMVar mvar $ Frozen wait
+        takeMVar wait
+        run f
+      ShouldSkip -> putMVar mvar Proceed >> run f
+      Frozen _ -> error "Impossible: Frozen in runCSF"
+      Die -> putMVar mvar Die >> return y
+    --end critical region
 
 runCSF' = runCSF ()
 
 stepCSF :: CSF a b -> [a] -> IO [b]
-stepCSF csf inp = newThreadState >>= stepCSF' csf inp where
-  stepCSF' _ [] ts = getThreads ts >>= mapM_ killThread >> return []
-  stepCSF' (MSF f) (x:xs) ts = do 
-    (rds, (y, f')) <- (unC $ f x) ts
+stepCSF csf inp = newPState Proceed >>= stepCSF' csf inp where
+  stepCSF' _ [] (_, children) = actOnChildren killProcess children >> return []
+  stepCSF' (MSF f) (x:xs) ps = do 
+    (rds, (y, f')) <- (unC $ f x) ps
     -- This next line performs the Ft-Time transition
     stepRData rds
-    ys <- stepCSF' f' xs ts
+    ys <- stepCSF' f' xs ps
     -- This next line kills all spawned threads
     return (y:ys)
 
 
 -- CMonad specific version of forkSF (for ease of coding)
 forkSF :: CSF () () -> CSF a a
-forkSF = forkSF' (\tid -> getThreadState >>= (\ts -> liftIO $ haveIForked ts tid)) forkRun
-  where
-    getThreadState :: CMonad ThreadState
-    getThreadState = CMonad $ \ts -> return ([],ts)
-    forkRun :: CSF () () -> CMonad ThreadId
-    forkRun csf = CMonad $ \ts -> do
-      newTS <- newThreadState
-      tid <- forkIO $ runCSF' newTS csf
-      addTid ts (tid, newTS)
-      return ([], tid)
+forkSF = forkSF' $ \csf -> CMonad $ \(mvar, refs) -> do
+  status <- takeMVar mvar --begin critical region
+  newPS <- newPState status
+  _tid <- forkIO $ runCSF' newPS csf
+  atomicModifyIORef refs $ \lst -> (PForkChild newPS:lst,())
+  putMVar mvar status --end critical region
+  return ([], ())
 
 -----------------------------------------------------------
 ---------------------- Constructions ----------------------

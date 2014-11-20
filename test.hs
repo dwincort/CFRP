@@ -15,7 +15,7 @@ import CSF
 data Console
 instance Resource Console String () where
   get _ = return ()
-  put _ = putStr
+  put _ _ = putStr
 
 
 -- A signal function that waits ten steps before outputting an event and
@@ -36,7 +36,7 @@ countToN :: CSF (Maybe Int) (Maybe String)
 countToN = letW [-1] $ \wh bh -> proc ma -> do
     [c] <- rsf wh -< ()
     let c' = maybe (c-1) id ma
---    rsf (undefined :: Console) -< show c'
+    rsf (undefined :: Console) -< show c'
     () <- rsf bh -< c'
     returnA -< if c' == 0 then Just "N" else Nothing
 
@@ -51,8 +51,8 @@ test0 wh bh = rsf bh >>> rsf wh >>> arr head
 test1 = letW [0] $ test0
 -- 2) Testing brsf updating
 -- runTest test2 [1..5]
-test2 :: CSF Int Int
-test2 = letW [0] $ \wh bh -> rsf bh >>> rsf wh >>> arr head
+--test2 :: CSF Int Int
+--test2 = letW [0] $ \wh bh -> rsf bh >>> brsf wh >>> arr head
 -- 3) Testing Console output and the use of wormholes to keep state
 -- runTest test3 (replicate 10 ())
 test3 :: CSF () ()
