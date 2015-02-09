@@ -15,7 +15,7 @@ import CSF
 data Console
 instance Resource Console String () where
   get _ = return ()
-  put _ _ = putStr
+  put _ = putStr
 
 
 -- A signal function that waits ten steps before outputting an event and

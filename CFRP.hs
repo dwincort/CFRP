@@ -30,28 +30,27 @@ import MSF
 --   resource to "update" the resource.
 class Resource rt a b | rt -> a, rt -> b where
   get :: rt -> IO b
-  put :: rt -> b -> a -> IO ()
+  put :: rt -> a -> IO ()
   rsf :: (MonadWriter [RData] m, MonadIO m) => rt -> MSF m {-S rt-} a b
   rsf rt = pipe $ \x -> do
-    y <- liftIO $ get rt
-    tell [RData rt x y]
-    return y
+    tell [RData rt x]
+    liftIO $ get rt
 
 -- The RData type feels like it should only need one constructor, 
 -- but whitehole data _must_ be processed _after_ blackhole data, 
 -- so we make a separate RDataW constructor for whitehole data and 
 -- then use it to sort a list of RData (as seen in stepRData below).
-data RData = forall rt a b . Resource rt a b => RData  rt a b
-           | forall rt a b . Resource rt a b => RDataW rt a b
+data RData = forall rt a b . Resource rt a b => RData  rt a
+           | forall rt a b . Resource rt a b => RDataW rt a
 
 -- This function encapsulates the resource data updating that should be done 
 -- during the "time step" of a signal function.  See Ft-Time transition.
 stepRData :: [RData] -> IO ()
 stepRData rds = let (rdws, rdbrs) = partition isRDataW rds
-                    isRDataW (RDataW _ _ _) = True
-                    isRDataW (RData  _ _ _) = False
-                    process (RDataW rt x y) = put rt y x
-                    process (RData  rt x y) = put rt y x
+                    isRDataW (RDataW _ _) = True
+                    isRDataW (RData  _ _) = False
+                    process (RDataW rt x) = put rt x
+                    process (RData  rt x) = put rt x
   in forM_ (rdbrs ++ rdws) process
 
 
@@ -61,30 +60,35 @@ stepRData rds = let (rdws, rdbrs) = partition isRDataW rds
 --  The WormholeData type is used to keep track of the contents of the wormhole
 --  The WData type is a wrapper to allow multiple WormholeDatas to be kept together
 -- TODO: Change this to a Seq, or something else with constant time access to both ends
-type WormholeData t = IORef [t]
+type WormholeData t = (IORef [t], IORef [t])
 
 --  The Whitehole and Blackhole types hold WormholeData along with a phantom 
 --  type that functions as the resource type for safety purposes.
 newtype Whitehole rt t = Whitehole (WormholeData t)
 newtype Blackhole rt t = Blackhole (WormholeData t)
 
-instance Resource (Whitehole rt t) () [t] where
-  get (Whitehole wd)   = readIORef wd
-  put (Whitehole wd) lst _ = atomicModifyIORef wd $ \w -> (drop (length lst) w, ())
+instance Resource (Whitehole r t) () [t] where
+  get (Whitehole (_,w))   = readIORef w
+  put (Whitehole (b,w)) _ = do
+    bdata <- atomicModifyIORef b $ \l -> ([], l)
+    atomicModifyIORef w $ \_ -> (reverse bdata, ())
   rsf rt = pipe $ \x -> do
-    y <- liftIO $ get rt
-    tell [RDataW rt x y]
-    return y
+    tell [RDataW rt x]
+    liftIO $ get rt
 
 instance Resource (Blackhole rt t) t () where
-  get (Blackhole wd)   = return ()
-  put (Blackhole wd) _ t = atomicModifyIORef wd $ \w -> (w++[t], ())
+  get (Blackhole _)   = return ()
+  put (Blackhole (b,_)) t = atomicModifyIORef b $ \l -> (t:l, ())
 
 
 letW :: forall m rw rb t a b. MonadIO m => 
        [t] -> (Whitehole rw t -> Blackhole rb t -> MSF m a b) -> MSF m a b
-letW t inner = initialAction (liftIO $ newIORef t) $ \ref -> 
-  inner (Whitehole ref) (Blackhole ref)
+letW t inner = initialAction makerefs $ \refs -> 
+  inner (Whitehole refs) (Blackhole refs)  where
+    makerefs = do
+        b <- liftIO $ newIORef []
+        w <- liftIO $ newIORef t
+        return (b,w)
     
 -----------------------------------------------------------
 ------------------------- Forking -------------------------
