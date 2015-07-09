@@ -63,13 +63,19 @@ newPState status = do
 -- etc. in the given PChildren.  That is, it acts on all PControllers 
 -- recursively within the given PChildren.  It is guaranteed to always act 
 -- and complete on parents before accessing and then moving on to children.
+actOnAllChildren :: (PController -> IO ()) -> PChildren -> IO ()
+actOnAllChildren = actOnChildrenHelper True
+
 actOnChildren :: (PController -> IO ()) -> PChildren -> IO ()
-actOnChildren f ref = do
+actOnChildren = actOnChildrenHelper False
+
+actOnChildrenHelper :: Bool -> (PController -> IO ()) -> PChildren -> IO ()
+actOnChildrenHelper recurP f ref = do
   childs <- readIORef ref
   mapM_ act childs
  where
-  act (PForkChild (pc, children)) = f pc >> actOnChildren f children
-  act (PChoiceChild children) = actOnChildren f children
+  act (PForkChild (pc, children)) = f pc >> actOnChildrenHelper recurP f children
+  act (PChoiceChild children) = if recurP then actOnChildrenHelper recurP f children else return ()
 
 
 -- These three functions are the functions to send to actOnChildren 
@@ -156,6 +162,7 @@ instance ArrowChoice CSF where
         Left x' -> CMonad $ \(ps,_pc) -> do
           status <- takeMVar ps --begin critical region
           case status of
+            --Since grand*children may be supposed to be sleeping, only wake up direct children
             Proceed -> actOnChildren wakeProcess choiceChildren
             _ -> return ()
           putMVar ps status --end critical region
@@ -164,7 +171,8 @@ instance ArrowChoice CSF where
         Right z -> CMonad $ \(ps,_pc) -> do
           status <- takeMVar ps --begin critical region
           case status of
-            Proceed -> actOnChildren freezeProcess choiceChildren
+            --Every thread in this branch should be frozen
+            Proceed -> actOnAllChildren freezeProcess choiceChildren
             _ -> return ()
           putMVar ps status --end critical region
           return ([],(Right z, MSF (h msf choiceChildren)))
@@ -202,7 +210,7 @@ runCSF' = runCSF ()
 
 stepCSF :: CSF a b -> [a] -> IO [b]
 stepCSF csf inp = newPState Proceed >>= stepCSF' csf inp where
-  stepCSF' _ [] (_, children) = actOnChildren killProcess children >> return []
+  stepCSF' _ [] (_, children) = actOnAllChildren killProcess children >> return []
   stepCSF' (MSF f) (x:xs) ps = do 
     (rds, (y, f')) <- (unC $ f x) ps
     -- This next line performs the Ft-Time transition
