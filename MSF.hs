@@ -1,24 +1,21 @@
-{-# LANGUAGE CPP #-}
 
+{-# LANGUAGE DataKinds, TypeOperators, KindSignatures, FlexibleInstances, MultiParamTypeClasses #-}
 module MSF where
+import TypeSet
+import Arrow
+import Control.Concurrent.MonadIO
 
-#if __GLASGOW_HASKELL__ >= 610
-import Control.Category
-import Prelude hiding ((.))
-#endif
-import Control.Arrow
 
 -- A MSF is a signal function that that can perform actions over an embedded monad
-data MSF m a b = MSF { msfFun :: (a -> m (b, MSF m a b)) }
+data MSF m (r :: [*]) a b = MSF { msfFun :: (a -> m (b, MSF m r a b)) }
 
 
 -----------------------------------------------------------
 --------------------- Arrow instances ---------------------
 -----------------------------------------------------------
-#if __GLASGOW_HASKELL__ >= 610
 instance Monad m => Category (MSF m) where
-  id = MSF h where h x = return (x, MSF h)
-  MSF g . MSF f = MSF (h f g)
+  iden = MSF h where h x = return (x, MSF h)
+  MSF g <<< MSF f = MSF (h f g)
     where h f g x    = do (y, MSF f') <- f x
                           (z, MSF g') <- g y
                           return (z, MSF (h f' g'))
@@ -41,30 +38,6 @@ instance Monad m => Arrow (MSF m) where
         (y, f') <- msfFun f (fst x)
         (z, g') <- msfFun g (snd x) 
         return ((y, z), MSF (h f' g'))
-#else
-instance Monad m => Arrow (MSF m) where
-  arr f = MSF h 
-    where h x = return (f x, MSF h)
-  MSF f >>> MSF g = MSF (h f g)
-    where h f g x    = do (y, MSF f') <- f x
-                          (z, MSF g') <- g y
-                          return (z, MSF (h f' g'))
-  first (MSF f) = MSF (h f)
-    where h f (x, z) = do (y, MSF f') <- f x
-                          return ((y, z), MSF (h f'))
-  f &&& g = MSF (h f g)
-    where
-      h f g x = do
-        (y, f') <- msfFun f x
-        (z, g') <- msfFun g x 
-        return ((y, z), MSF (h f' g'))
-  f *** g = MSF (h f g)
-    where
-      h f g x = do
-        (y, f') <- msfFun f (fst x)
-        (z, g') <- msfFun g (snd x) 
-        return ((y, z), MSF (h f' g'))
-#endif
 
 instance Monad m => ArrowChoice (MSF m) where
   left msf = MSF (h msf)
@@ -79,43 +52,47 @@ instance Monad m => ArrowChoice (MSF m) where
                       Right c -> do (d, g') <- msfFun g c
                                     return (d, MSF (h f g'))
 
+instance Monad m => ArrowAction m (MSF m) where
+    initialAction mx f = MSF $ \a -> do
+      x <- mx
+      msfFun (f x) a
 
 -----------------------------------------------------------
 -------------------- MSF Constructors ---------------------
 -----------------------------------------------------------
 
-source :: Monad m => m c ->         MSF m () c
-sink   :: Monad m => (b -> m ()) -> MSF m b  ()
-pipe   :: Monad m => (b -> m c) ->  MSF m b  c
-source f = MSF h where h _ = f   >>= return . (\x -> (x, MSF h))
-sink   f = MSF h where h x = f x >> return ((), MSF h)
+--source :: Monad m => m c ->         MSF m () c
+--sink   :: Monad m => (b -> m ()) -> MSF m b  ()
+pipe   :: Monad m => (b -> m c) ->  MSF m r b  c
+--source f = MSF h where h _ = f   >>= return . (\x -> (x, MSF h))
+--sink   f = MSF h where h x = f x >> return ((), MSF h)
 pipe   f = MSF h where h x = f x >>= return . (\x -> (x, MSF h))
-
-sourceE :: Monad m => m c ->         MSF m (Maybe ()) (Maybe c)
-sinkE   :: Monad m => (b -> m ()) -> MSF m (Maybe b)  (Maybe ())
-pipeE   :: Monad m => (b -> m c) ->  MSF m (Maybe b)  (Maybe c)
-sourceE f = MSF h where h = maybe (return (Nothing, MSF h)) (\_ -> f   >>= return . (\c -> (Just c, MSF h)))
-sinkE   f = MSF h where h = maybe (return (Nothing, MSF h)) (\b -> f b >>  return (Just (), MSF h))
-pipeE   f = MSF h where h = maybe (return (Nothing, MSF h)) (\b -> f b >>= return . (\c -> (Just c, MSF h)))
-
-initialAction :: Monad m => m x -> (x -> MSF m a b) -> MSF m a b
-initialAction mx f = MSF $ \a -> do
-  x <- mx
-  msfFun (f x) a
+--
+--sourceE :: Monad m => m c ->         MSF m (Maybe ()) (Maybe c)
+--sinkE   :: Monad m => (b -> m ()) -> MSF m (Maybe b)  (Maybe ())
+--pipeE   :: Monad m => (b -> m c) ->  MSF m (Maybe b)  (Maybe c)
+--sourceE f = MSF h where h = maybe (return (Nothing, MSF h)) (\_ -> f   >>= return . (\c -> (Just c, MSF h)))
+--sinkE   f = MSF h where h = maybe (return (Nothing, MSF h)) (\b -> f b >>  return (Just (), MSF h))
+--pipeE   f = MSF h where h = maybe (return (Nothing, MSF h)) (\b -> f b >>= return . (\c -> (Just c, MSF h)))
+--
+--initialAction :: Monad m => m x -> (x -> MSF m a b) -> MSF m a b
+--initialAction mx f = MSF $ \a -> do
+--  x <- mx
+--  msfFun (f x) a
 
 
 -----------------------------------------------------------
 ----------------------- MSF Runners -----------------------
 -----------------------------------------------------------
 
-stepMSF :: Monad m => MSF m a b -> [a] -> m [b]
+stepMSF :: Monad m => MSF m r a b -> [a] -> m [b]
 stepMSF _ [] = return []
 stepMSF (MSF f) (x:xs) = do 
   (y, f') <- f x
   ys <- stepMSF f' xs
   return (y:ys)
 
-stepMSF' :: Monad m => MSF m a b -> [a] -> m ([b], MSF m a b)
+stepMSF' :: Monad m => MSF m r a b -> [a] -> m ([b], MSF m r a b)
 stepMSF' g [] = return ([], g)
 stepMSF' (MSF f) (x:xs) = do 
   (y, f') <- f x
@@ -123,13 +100,13 @@ stepMSF' (MSF f) (x:xs) = do
   return (y:ys, g)
 
 data Stream m b = Stream { stream :: m (b, Stream m b) }
-streamMSF :: Monad m => MSF m a b -> [a] -> Stream m b
+streamMSF :: Monad m => MSF m r a b -> [a] -> Stream m b
 streamMSF (MSF f) (x:xs) = Stream $ do 
   (y, f') <- f x
   return (y, streamMSF f' xs)
 
-runMSF :: Monad m => a -> MSF m a b -> m b
+runMSF :: Monad m => a -> MSF m r a b -> m b
 runMSF a f = run f where run (MSF f) = do f a >>= run . snd
 
-runMSF' :: Monad m => MSF m () b -> m b
+runMSF' :: Monad m => MSF m r () b -> m b
 runMSF' = runMSF ()

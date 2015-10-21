@@ -1,16 +1,16 @@
 {-# LANGUAGE Arrows, ExistentialQuantification, FlexibleInstances, MultiParamTypeClasses, TypeSynonymInstances, TypeSynonymInstances, OverlappingInstances #-}
+{-# LANGUAGE TypeFamilies, ScopedTypeVariables, FlexibleContexts, DataKinds #-}
 
 module CSF (
   CSF, runCSF, stepCSF, 
   forkSF, 
-  async, buffer, parTo, spar, 
+  --async, buffer, parTo, spar, 
   --Reexporting
   Resource (..), --BResource (..), 
   letW,
   RData, Whitehole, Blackhole
 ) where
 
-import Control.Arrow
 import Control.Monad (ap)
 import Control.Applicative
 import Control.Concurrent.MonadIO
@@ -20,6 +20,8 @@ import Data.Maybe (isJust, listToMaybe, catMaybes)
 
 import Control.Monad.Writer.Strict
 
+import TypeSet
+import Arrow
 import SF
 import MSF
 import CFRP
@@ -183,7 +185,7 @@ instance ArrowChoice CSF where
 
 
 -- Running and stepping through CSFs
-runCSF :: a -> PState -> CSF a b -> IO b
+runCSF :: a -> PState -> CSF r a b -> IO b
 runCSF a (ps@(mvar, _)) f = run f where 
   run f = do 
     (rds, (y, f')) <- (unC $ msfFun f $ a) ps
@@ -208,7 +210,7 @@ runCSF a (ps@(mvar, _)) f = run f where
 
 runCSF' = runCSF ()
 
-stepCSF :: CSF a b -> [a] -> IO [b]
+stepCSF :: CSF r a b -> [a] -> IO [b]
 stepCSF csf inp = newPState Proceed >>= stepCSF' csf inp where
   stepCSF' _ [] (_, children) = actOnAllChildren killProcess children >> return []
   stepCSF' (MSF f) (x:xs) ps = do 
@@ -221,7 +223,7 @@ stepCSF csf inp = newPState Proceed >>= stepCSF' csf inp where
 
 
 -- CMonad specific version of forkSF (for ease of coding)
-forkSF :: CSF () () -> CSF a a
+forkSF :: CSF r () () -> CSF r a a
 forkSF = forkSF' $ \csf -> CMonad $ \(mvar, refs) -> do
   status <- takeMVar mvar --begin critical region
   newPS <- newPState status
@@ -234,10 +236,45 @@ forkSF = forkSF' $ \csf -> CMonad $ \(mvar, refs) -> do
 ---------------------- Constructions ----------------------
 -----------------------------------------------------------
 
-async :: CSF [a] b -> CSF a [b]
+data Console
+instance Resource Console String () where
+  get _ = return ()
+  put _ = putStr
+
+myfun :: CSF '[Int] [a] a -> CSF '[Int] () ()
+myfun sf = letW [] f
+  where f w b = rsf w >>> sf >>> rsf b
+
+
+myfun2 :: forall a. CSF '[] [a] a -> CSF '[] () [a]
+myfun2 sf = letW [] f where
+--  f :: forall rw1 rb1. (Resource rw1 () [a]) => rw1 -> rb1 -> CSF '[rw1] () [a]
+  f w1 b1 = letW [] g where
+--    g :: forall rw2 rb2. (Resource rw2 () [a], ElemOf rw2 '[rw1] ~ False)
+--      => rw2 -> rb2 -> CSF '[rw2,rw1] () [a]
+    g w2 b2 = rsf w2 >>> arr (const ()) >>> rsf w1
+
+
+myf :: forall rw1 rb1 a. (Resource rw1 () [a])
+    => rw1 -> rb1 -> CSF '[rw1] () [a]
+myf w1 b1 = letW [] (myg w1)
+
+--myg :: forall rw1 rw2 rb2 a. (Resource rw1 () [a], Resource rw2 () [a])
+--    => rw1 -> rw2 -> rb2 -> CSF '[rw2,rw1] () [a]
+myg w1 w2 b2 = rsf w2 >>> arr (const undefined) >>> rsf w1
+
+async :: CSF '[Int] [a] b -> CSF '[Int] a [b]
 async sf = letW [] $ \wi bi -> letW [] $ \wo bo -> forkSF (g wi bo) >>> (f bi wo)
   where f bi wo = rsf bi >>> rsf wo
         g wi bo = rsf wi >>> sf >>> rsf bo
+
+parTo :: CSF '[Int] a (Maybe b) -> CSF '[Char] (Maybe b) () -> CSF '[Char,Int] a ()
+sf1 `parTo` sf2 = letW [] $ \w b -> forkSF (g w) >>> f b
+  where f b = sf1 >>> rsf b
+        g w = buffer (rsf w) >>> sf2
+        buffer = undefined :: CSF r a [Maybe b] -> CSF r a (Maybe b)
+
+{-
 
 --par :: CSF a b -> CSF a c -> CSF a (b,c)
 --sf1 `par` sf2 = letW [] $ \wi bi -> letW [] $ \wo bo -> forkSF (f bi wo) (g wi bo)
@@ -282,4 +319,4 @@ sf1 `spar` sf2 = letW [] $ \rw rb -> proc a -> do
       returnA -< Nothing
   where collapse = listToMaybe . catMaybes
 
-
+-}

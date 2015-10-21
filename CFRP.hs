@@ -1,4 +1,5 @@
 {-# LANGUAGE ExistentialQuantification, ScopedTypeVariables, FlexibleContexts, FlexibleInstances, FunctionalDependencies #-}
+{-# LANGUAGE DataKinds, TypeFamilies #-}
 
 module CFRP (
   Resource (..), --BResource (..), 
@@ -7,7 +8,8 @@ module CFRP (
   forkSF'
 ) where
 
-import Control.Arrow
+import TypeSet
+import Arrow
 import Control.Concurrent.MonadIO
 
 import Data.IORef
@@ -20,6 +22,8 @@ import Control.Monad.Writer.Strict
 import SF
 import MSF
 
+import Unsafe.Coerce
+
 
 -----------------------------------------------------------
 -------------------- Resource classes ---------------------
@@ -31,7 +35,7 @@ import MSF
 class Resource rt a b | rt -> a, rt -> b where
   get :: rt -> IO b
   put :: rt -> a -> IO ()
-  rsf :: (MonadWriter [RData] m, MonadIO m) => rt -> MSF m {-S rt-} a b
+  rsf :: (MonadWriter [RData] m, MonadIO m) => rt -> MSF m '[rt] a b
   rsf rt = pipe $ \x -> do
     tell [RData rt x]
     liftIO $ get rt
@@ -81,14 +85,18 @@ instance Resource (Blackhole rt t) t () where
   put (Blackhole (b,_)) t = atomicModifyIORef b $ \l -> (t:l, ())
 
 
-letW :: forall m rw rb t a b. MonadIO m => 
-       [t] -> (Whitehole rw t -> Blackhole rb t -> MSF m a b) -> MSF m a b
-letW t inner = initialAction makerefs $ \refs -> 
-  inner (Whitehole refs) (Blackhole refs)  where
-    makerefs = do
-        b <- liftIO $ newIORef []
-        w <- liftIO $ newIORef t
-        return (b,w)
+letW :: forall m rt r r' r'' t a b. 
+       (MonadIO m, LRemove (Whitehole rt t) r r', LRemove (Blackhole rt t) r' r'') => 
+       [t] -> (Whitehole rt t -> Blackhole rt t -> MSF m r a b) -> MSF m r'' a b
+letW t inner = lremove (undefined::Blackhole rt t) $ 
+  lremove (undefined::Whitehole rt t) $ 
+  initialAction makerefs $ \refs -> 
+    inner (Whitehole refs) (Blackhole refs)  where
+      makerefs :: m (IORef [t1], IORef [t])
+      makerefs = do
+          b <- liftIO $ newIORef []
+          w <- liftIO $ newIORef t
+          return (b,w)
     
 -----------------------------------------------------------
 ------------------------- Forking -------------------------
@@ -96,8 +104,10 @@ letW t inner = initialAction makerefs $ \refs ->
 
 -- This function is the generic version of forkSF.
 -- That is, it requires a function to run the forked signal function.
-forkSF' :: MonadIO m => (MSF m () () -> m ()) ->
-                        MSF m () () -> MSF m a a
-forkSF' forkRun e = initialAction (forkRun e) $ const $ arr id
+forkSF' :: forall m r a. MonadIO m => 
+    (MSF m r () () -> m ()) ->
+     MSF m r () () -> MSF m r a a
+forkSF' forkRun e = initialAction (forkRun e) $ const $ 
+    ((unsafeCoerce (iden :: MSF m '[] a a)) :: MSF m r a a)
 
 
